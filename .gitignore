@@ -2,3 +2,14 @@
 chat.db
 chat.db-shm
 chat.db-wal
+*.db
+*.db-shm
+*.db-wal
+
+# Xcode user/local state
+*.xcuserstate
+xcuserdata/
+
+# Build products
+DerivedData/
+build/
