@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		B1E6EC082F92DE5800A8C9D3 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = B1E6EC072F92DE5800A8C9D3 /* libsqlite3.tbd */; };
+		B1E6EC0A2F92DFAE00A8C9D3 /* chat.db in Resources */ = {isa = PBXBuildFile; fileRef = B1E6EC092F92DFAE00A8C9D3 /* chat.db */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -32,6 +33,7 @@
 		B1E6EBE92F92DCEB00A8C9D3 /* iMessageManagerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = iMessageManagerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B1E6EBF32F92DCEB00A8C9D3 /* iMessageManagerUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = iMessageManagerUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		B1E6EC072F92DE5800A8C9D3 /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
+		B1E6EC092F92DFAE00A8C9D3 /* chat.db */ = {isa = PBXFileReference; lastKnownFileType = file; path = chat.db; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -81,6 +83,7 @@
 		B1E6EBD32F92DCEA00A8C9D3 = {
 			isa = PBXGroup;
 			children = (
+				B1E6EC092F92DFAE00A8C9D3 /* chat.db */,
 				B1E6EBDE2F92DCEA00A8C9D3 /* iMessageManager */,
 				B1E6EBEC2F92DCEB00A8C9D3 /* iMessageManagerTests */,
 				B1E6EBF62F92DCEB00A8C9D3 /* iMessageManagerUITests */,
@@ -227,6 +230,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				B1E6EC0A2F92DFAE00A8C9D3 /* chat.db in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
