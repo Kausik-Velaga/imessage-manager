@@ -1,3 +1,6 @@
+# macOS local files
+.DS_Store
+
 # SQLite files
 chat.db
 chat.db-shm
@@ -8,8 +11,19 @@ chat.db-wal
 
 # Xcode user/local state
 *.xcuserstate
-xcuserdata/
+**/xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+*.xcuserdatad/
+*.xcdebugger/
 
 # Build products
 DerivedData/
 build/
+*.dSYM
+*.dSYM.zip
+*.ipa
+
+# SwiftPM/local build artifacts
+.build/
