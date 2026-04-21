@@ -214,20 +214,21 @@ final class ChatDatabase {
     }
 
     func fetchMessageSamples(for chatID: Int64, limit: Int = 30) throws -> [ConversationMessageSample] {
+        let rawLimit = max(limit * 4, limit)
         let sql = """
-        SELECT text, is_from_me, date
-        FROM (
-            SELECT m.text, m.is_from_me, m.date
-            FROM chat_message_join cmj
-            JOIN message m ON m.ROWID = cmj.message_id
-            WHERE cmj.chat_id = ?
-                AND m.text IS NOT NULL
-                AND TRIM(m.text) != ''
-                AND m.is_system_message = 0
-            ORDER BY m.date DESC
-            LIMIT ?
-        )
-        ORDER BY date ASC
+        SELECT m.text, m.attributedBody, m.cache_has_attachments, m.is_from_me, m.date
+        FROM chat_message_join cmj
+        JOIN message m ON m.ROWID = cmj.message_id
+        WHERE cmj.chat_id = ?
+            AND m.is_system_message = 0
+            AND m.is_empty = 0
+            AND (
+                (m.text IS NOT NULL AND TRIM(m.text) != '')
+                OR m.attributedBody IS NOT NULL
+                OR m.cache_has_attachments = 1
+            )
+        ORDER BY COALESCE(m.date, 0) DESC, m.ROWID DESC
+        LIMIT ?
         """
 
         var statement: OpaquePointer?
@@ -240,55 +241,52 @@ final class ChatDatabase {
         }
 
         sqlite3_bind_int64(statement, 1, chatID)
-        sqlite3_bind_int(statement, 2, Int32(limit))
+        sqlite3_bind_int(statement, 2, Int32(rawLimit))
 
         var messages: [ConversationMessageSample] = []
 
         while sqlite3_step(statement) == SQLITE_ROW {
-            guard let text = Self.nonEmpty(Self.string(statement, 0)) else {
+            guard messages.count < limit else {
+                break
+            }
+
+            guard let text = Self.messageText(
+                text: Self.string(statement, 0),
+                attributedBody: Self.data(statement, 1),
+                hasAttachment: sqlite3_column_int(statement, 2) != 0
+            ) else {
                 continue
             }
 
             messages.append(
                 ConversationMessageSample(
                     text: Self.truncated(text, maxLength: 500),
-                    isFromMe: sqlite3_column_int(statement, 1) != 0,
-                    date: Self.appleDate(statement, 2)
+                    isFromMe: sqlite3_column_int(statement, 3) != 0,
+                    date: Self.appleDate(statement, 4)
                 )
             )
         }
 
-        return messages
+        return messages.reversed()
     }
 
     func fetchMessages(for chatID: Int64, limit: Int = 200) throws -> [ConversationMessage] {
+        let rawLimit = max(limit * 4, limit)
         let sql = """
-        SELECT message_id, display_text, is_from_me, date, sender_handle
-        FROM (
-            SELECT
-                m.ROWID AS message_id,
-                CASE
-                    WHEN m.text IS NOT NULL AND TRIM(m.text) != '' THEN m.text
-                    WHEN m.cache_has_attachments = 1 THEN '[Attachment]'
-                    ELSE NULL
-                END AS display_text,
-                m.is_from_me,
-                m.date,
-                h.id AS sender_handle
-            FROM chat_message_join cmj
-            JOIN message m ON m.ROWID = cmj.message_id
-            LEFT JOIN handle h ON h.ROWID = m.handle_id
-            WHERE cmj.chat_id = ?
-                AND m.is_system_message = 0
-                AND m.is_empty = 0
-                AND (
-                    (m.text IS NOT NULL AND TRIM(m.text) != '')
-                    OR m.cache_has_attachments = 1
-                )
-            ORDER BY COALESCE(m.date, 0) DESC, m.ROWID DESC
-            LIMIT ?
-        )
-        ORDER BY COALESCE(date, 0) ASC, message_id ASC
+        SELECT m.ROWID, m.text, m.attributedBody, m.cache_has_attachments, m.is_from_me, m.date, h.id
+        FROM chat_message_join cmj
+        JOIN message m ON m.ROWID = cmj.message_id
+        LEFT JOIN handle h ON h.ROWID = m.handle_id
+        WHERE cmj.chat_id = ?
+            AND m.is_system_message = 0
+            AND m.is_empty = 0
+            AND (
+                (m.text IS NOT NULL AND TRIM(m.text) != '')
+                OR m.attributedBody IS NOT NULL
+                OR m.cache_has_attachments = 1
+            )
+        ORDER BY COALESCE(m.date, 0) DESC, m.ROWID DESC
+        LIMIT ?
         """
 
         var statement: OpaquePointer?
@@ -301,12 +299,20 @@ final class ChatDatabase {
         }
 
         sqlite3_bind_int64(statement, 1, chatID)
-        sqlite3_bind_int(statement, 2, Int32(limit))
+        sqlite3_bind_int(statement, 2, Int32(rawLimit))
 
         var messages: [ConversationMessage] = []
 
         while sqlite3_step(statement) == SQLITE_ROW {
-            guard let text = Self.nonEmpty(Self.string(statement, 1)) else {
+            guard messages.count < limit else {
+                break
+            }
+
+            guard let text = Self.messageText(
+                text: Self.string(statement, 1),
+                attributedBody: Self.data(statement, 2),
+                hasAttachment: sqlite3_column_int(statement, 3) != 0
+            ) else {
                 continue
             }
 
@@ -314,14 +320,14 @@ final class ChatDatabase {
                 ConversationMessage(
                     id: sqlite3_column_int64(statement, 0),
                     text: text,
-                    isFromMe: sqlite3_column_int(statement, 2) != 0,
-                    date: Self.appleDate(statement, 3),
-                    senderHandle: Self.nonEmpty(Self.string(statement, 4))
+                    isFromMe: sqlite3_column_int(statement, 4) != 0,
+                    date: Self.appleDate(statement, 5),
+                    senderHandle: Self.nonEmpty(Self.string(statement, 6))
                 )
             )
         }
 
-        return messages
+        return messages.reversed()
     }
 
     private static func string(_ statement: OpaquePointer?, _ column: Int32) -> String? {
@@ -330,6 +336,19 @@ final class ChatDatabase {
         }
 
         return String(cString: text)
+    }
+
+    private static func data(_ statement: OpaquePointer?, _ column: Int32) -> Data? {
+        guard let bytes = sqlite3_column_blob(statement, column) else {
+            return nil
+        }
+
+        let byteCount = sqlite3_column_bytes(statement, column)
+        guard byteCount > 0 else {
+            return nil
+        }
+
+        return Data(bytes: bytes, count: Int(byteCount))
     }
 
     private static func appleDate(_ statement: OpaquePointer?, _ column: Int32) -> Date? {
@@ -398,6 +417,114 @@ final class ChatDatabase {
         }
 
         return []
+    }
+
+    private static func messageText(text: String?, attributedBody: Data?, hasAttachment: Bool) -> String? {
+        if let text = nonEmpty(text) {
+            return text
+        }
+
+        if let text = attributedBodyText(attributedBody) {
+            return text
+        }
+
+        if hasAttachment {
+            return "[Attachment]"
+        }
+
+        return nil
+    }
+
+    private static func attributedBodyText(_ data: Data?) -> String? {
+        guard let data else {
+            return nil
+        }
+
+        let allowedClasses: [AnyClass] = [
+            NSAttributedString.self,
+            NSMutableAttributedString.self,
+            NSString.self,
+            NSArray.self,
+            NSDictionary.self,
+            NSNumber.self,
+            NSData.self,
+            NSURL.self
+        ]
+
+        if let object = try? NSKeyedUnarchiver.unarchivedObject(ofClasses: allowedClasses, from: data) {
+            if let attributedString = object as? NSAttributedString {
+                return nonEmpty(attributedString.string)
+            }
+
+            if let string = object as? String {
+                return nonEmpty(string)
+            }
+        }
+
+        return archivedAttributedStringText(data)
+    }
+
+    private static func archivedAttributedStringText(_ data: Data) -> String? {
+        guard let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+              let objects = plist["$objects"] as? [Any] else {
+            return nil
+        }
+
+        for object in objects {
+            guard let dictionary = object as? [String: Any],
+                  let stringReference = dictionary["NSString"],
+                  let stringIndex = keyedArchiveIndex(stringReference),
+                  objects.indices.contains(stringIndex),
+                  let text = objects[stringIndex] as? String,
+                  let nonEmptyText = nonEmpty(text) else {
+                continue
+            }
+
+            return nonEmptyText
+        }
+
+        return nil
+    }
+
+    private static func keyedArchiveIndex(_ value: Any) -> Int? {
+        if let number = value as? NSNumber {
+            return number.intValue
+        }
+
+        for child in Mirror(reflecting: value).children {
+            if let index = child.value as? Int {
+                return index
+            }
+
+            if let index = child.value as? UInt32 {
+                return Int(index)
+            }
+
+            if let index = child.value as? UInt64 {
+                return Int(index)
+            }
+        }
+
+        let description = String(describing: value)
+        guard let valueRange = description.range(of: "value") else {
+            return nil
+        }
+
+        return firstInteger(in: description[valueRange.upperBound...])
+    }
+
+    private static func firstInteger<S: StringProtocol>(in value: S) -> Int? {
+        var digits = ""
+
+        for character in value {
+            if character.isNumber {
+                digits.append(character)
+            } else if !digits.isEmpty {
+                return Int(digits)
+            }
+        }
+
+        return Int(digits)
     }
 
     private static func summarizedParticipants(_ participants: [String]) -> String {

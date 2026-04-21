@@ -11,11 +11,15 @@ struct ContentView: View {
     @State private var messageErrorNotice: ErrorNotice?
     @State private var openAIAPIKey = ""
     @State private var isCategorizing = false
+    @State private var isEstimatingCategorizationCost = false
+    @State private var categorizationCostEstimate: CategorizationCostEstimate?
+    @State private var selectedChatCategorizationCostEstimate: CategorizationCostEstimate?
     @State private var classificationRationale: String?
     @State private var settingsMessage: String?
     @State private var errorNotice: ErrorNotice?
 
     private let messageDisplayLimit = 200
+    private let categorizationSampleLimit = 30
 
     private var selectedChat: ChatSummary? {
         chats.first { $0.id == selectedChatID }
@@ -86,7 +90,7 @@ struct ContentView: View {
                     messageErrorNotice: messageErrorNotice,
                     messageLimit: messageDisplayLimit,
                     onReloadMessages: {
-                        loadMessages(for: selectedChat)
+                        loadConversationDetails(for: selectedChat)
                     },
                     errorNotice: errorNotice,
                     onDismissError: {
@@ -102,6 +106,7 @@ struct ContentView: View {
                     onDeleteTodo: deleteTodo,
                     hasOpenAIAPIKey: hasOpenAIAPIKey,
                     isCategorizing: isCategorizing,
+                    categorizationCostEstimate: selectedChatCategorizationCostEstimate,
                     classificationRationale: classificationRationale,
                     onCategorizeWithLLM: {
                         Task {
@@ -110,7 +115,7 @@ struct ContentView: View {
                     }
                 )
                 .task(id: selectedChat.id) {
-                    loadMessages(for: selectedChat)
+                    loadConversationDetails(for: selectedChat)
                 }
             } else if let errorNotice {
                 ErrorNoticeView(notice: errorNotice) {
@@ -196,6 +201,27 @@ struct ContentView: View {
                     ErrorNoticeView(notice: errorNotice) {
                         self.errorNotice = nil
                     }
+                }
+            }
+
+            Section("Categorization Cost") {
+                Text("Estimate the cost of categorizing every conversation before making any OpenAI API calls.")
+                    .foregroundStyle(.secondary)
+
+                Button {
+                    estimateCategorizationCost()
+                } label: {
+                    if isEstimatingCategorizationCost {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Text("Estimate All Conversations")
+                    }
+                }
+                .disabled(isEstimatingCategorizationCost || chats.isEmpty)
+
+                if let categorizationCostEstimate {
+                    CategorizationCostEstimateView(estimate: categorizationCostEstimate)
                 }
             }
         }
@@ -290,7 +316,7 @@ struct ContentView: View {
             }
 
             let chatDatabase = try ChatDatabase()
-            let messages = try chatDatabase.fetchMessageSamples(for: chat.id)
+            let messages = try chatDatabase.fetchMessageSamples(for: chat.id, limit: categorizationSampleLimit)
             let client = OpenAIClient(apiKey: openAIAPIKey)
             let classification = try await client.classifyConversation(chat: chat, messages: messages)
 
@@ -304,14 +330,40 @@ struct ContentView: View {
         isCategorizing = false
     }
 
-    private func loadMessages(for chat: ChatSummary) {
+    private func estimateCategorizationCost() {
+        isEstimatingCategorizationCost = true
+        errorNotice = nil
+
+        do {
+            let chatDatabase = try ChatDatabase()
+            categorizationCostEstimate = try CategorizationCostEstimator.estimate(
+                chats: chats,
+                chatDatabase: chatDatabase,
+                sampleMessageLimit: categorizationSampleLimit
+            )
+        } catch {
+            categorizationCostEstimate = nil
+            presentError(error)
+        }
+
+        isEstimatingCategorizationCost = false
+    }
+
+    private func loadConversationDetails(for chat: ChatSummary) {
         selectedChatMessages = []
+        selectedChatCategorizationCostEstimate = nil
         isLoadingMessages = true
         messageErrorNotice = nil
 
         do {
             let chatDatabase = try ChatDatabase()
             selectedChatMessages = try chatDatabase.fetchMessages(for: chat.id, limit: messageDisplayLimit)
+            let sampleMessages = try chatDatabase.fetchMessageSamples(for: chat.id, limit: categorizationSampleLimit)
+            selectedChatCategorizationCostEstimate = CategorizationCostEstimator.estimate(
+                chat: chat,
+                messages: sampleMessages,
+                sampleMessageLimit: categorizationSampleLimit
+            )
         } catch {
             messageErrorNotice = ErrorNotice(error)
         }
@@ -574,6 +626,70 @@ private struct ErrorNoticeView: View {
     }
 }
 
+private struct CategorizationCostEstimateView: View {
+    let estimate: CategorizationCostEstimate
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("No API calls were made.")
+                .font(.headline)
+
+            Text("Estimate uses \(estimate.modelName), the latest \(estimate.sampleMessageLimit) messages per conversation, and a conservative output allowance.")
+                .foregroundStyle(.secondary)
+
+            Divider()
+
+            LabeledContent("Conversations", value: estimate.totalConversations.formatted())
+            LabeledContent("With message samples", value: estimate.conversationsWithMessageSamples.formatted())
+            LabeledContent("Sample messages", value: estimate.totalSampleMessages.formatted())
+            LabeledContent("Estimated input tokens", value: estimate.estimatedInputTokens.formatted())
+            LabeledContent("Estimated output tokens", value: estimate.estimatedOutputTokens.formatted())
+
+            Divider()
+
+            LabeledContent("Estimated standard cost", value: CostEstimateFormat.currency(estimate.standardCost))
+                .font(.headline)
+            LabeledContent("Estimated Batch API cost", value: CostEstimateFormat.currency(estimate.batchCost))
+
+            Text("Batch API is cheaper but asynchronous. We should still add a hard spending cap before running bulk categorization.")
+                .foregroundStyle(.secondary)
+        }
+        .padding(.top, 4)
+    }
+}
+
+private struct ConversationCategorizationCostEstimateView: View {
+    let estimate: CategorizationCostEstimate
+
+    var body: some View {
+        Text("Estimated cost for one click: \(CostEstimateFormat.currency(estimate.standardCost)) using \(estimate.totalSampleMessages) recent \(messageLabel). Estimate is local; OpenAI is only called when you click the button.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    private var messageLabel: String {
+        estimate.totalSampleMessages == 1 ? "message" : "messages"
+    }
+}
+
+private enum CostEstimateFormat {
+    static func currency(_ value: Double) -> String {
+        if value > 0 && value < 0.01 {
+            return "<$0.01"
+        }
+
+        return currencyFormatter.string(from: NSNumber(value: value)) ?? String(format: "$%.2f", value)
+    }
+
+    private static let currencyFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        return formatter
+    }()
+}
+
 private struct ConversationSortPicker: View {
     @Binding var selection: ConversationSort
 
@@ -645,6 +761,7 @@ private struct ConversationDetailView: View {
     let onDeleteTodo: (ConversationTodo) -> Void
     let hasOpenAIAPIKey: Bool
     let isCategorizing: Bool
+    let categorizationCostEstimate: CategorizationCostEstimate?
     let classificationRationale: String?
     let onCategorizeWithLLM: () -> Void
 
@@ -711,6 +828,10 @@ private struct ConversationDetailView: View {
                         Text(classificationRationale)
                             .foregroundStyle(.secondary)
                     }
+                }
+
+                if let categorizationCostEstimate {
+                    ConversationCategorizationCostEstimateView(estimate: categorizationCostEstimate)
                 }
 
                 if !hasOpenAIAPIKey {
