@@ -6,11 +6,16 @@ struct ContentView: View {
     @State private var selectedChatID: ChatSummary.ID?
     @State private var selectedCategory: RelationshipCategory = .unknown
     @State private var conversationSort: ConversationSort = .latest
+    @State private var selectedChatMessages: [ConversationMessage] = []
+    @State private var isLoadingMessages = false
+    @State private var messageErrorNotice: ErrorNotice?
     @State private var openAIAPIKey = ""
     @State private var isCategorizing = false
     @State private var classificationRationale: String?
     @State private var settingsMessage: String?
-    @State private var errorMessage: String?
+    @State private var errorNotice: ErrorNotice?
+
+    private let messageDisplayLimit = 200
 
     private var selectedChat: ChatSummary? {
         chats.first { $0.id == selectedChatID }
@@ -72,14 +77,21 @@ struct ContentView: View {
                 .navigationTitle("Conversations")
             }
         } detail: {
-            if let errorMessage {
-                Text(errorMessage)
-                    .foregroundStyle(.red)
-                    .padding()
-            } else if let selectedChat {
+            if let selectedChat {
                 ConversationDetailView(
                     chat: selectedChat,
+                    messages: selectedChatMessages,
                     todos: todos.filter { $0.chatGuid == selectedChat.guid },
+                    isLoadingMessages: isLoadingMessages,
+                    messageErrorNotice: messageErrorNotice,
+                    messageLimit: messageDisplayLimit,
+                    onReloadMessages: {
+                        loadMessages(for: selectedChat)
+                    },
+                    errorNotice: errorNotice,
+                    onDismissError: {
+                        errorNotice = nil
+                    },
                     onCategoryChange: { category in
                         setCategory(category, for: selectedChat)
                     },
@@ -97,6 +109,14 @@ struct ContentView: View {
                         }
                     }
                 )
+                .task(id: selectedChat.id) {
+                    loadMessages(for: selectedChat)
+                }
+            } else if let errorNotice {
+                ErrorNoticeView(notice: errorNotice) {
+                    self.errorNotice = nil
+                }
+                .padding()
             } else {
                 ContentUnavailableView("Select a conversation", systemImage: "message")
             }
@@ -171,6 +191,12 @@ struct ContentView: View {
                     Text(settingsMessage)
                         .foregroundStyle(.secondary)
                 }
+
+                if let errorNotice {
+                    ErrorNoticeView(notice: errorNotice) {
+                        self.errorNotice = nil
+                    }
+                }
             }
         }
         .formStyle(.grouped)
@@ -193,9 +219,9 @@ struct ContentView: View {
                 contactResolver: contactResolver
             )
             todos = try appDatabase.fetchTodos()
-            errorMessage = nil
+            errorNotice = nil
         } catch {
-            errorMessage = String(describing: error)
+            presentError(error)
         }
     }
 
@@ -223,9 +249,9 @@ struct ContentView: View {
     private func setCategory(_ category: RelationshipCategory, for chat: ChatSummary) {
         do {
             try setCategory(category, for: chat, shouldSwitchCategory: true)
-            errorMessage = nil
+            errorNotice = nil
         } catch {
-            errorMessage = String(describing: error)
+            presentError(error)
         }
     }
 
@@ -246,16 +272,17 @@ struct ContentView: View {
         do {
             try KeychainStore.setOpenAIAPIKey(openAIAPIKey)
             settingsMessage = hasOpenAIAPIKey ? "OpenAI API key saved." : "OpenAI API key cleared."
-            errorMessage = nil
+            errorNotice = nil
         } catch {
             settingsMessage = nil
-            errorMessage = String(describing: error)
+            presentError(error)
         }
     }
 
     private func categorizeWithLLM(_ chat: ChatSummary) async {
         isCategorizing = true
         classificationRationale = nil
+        errorNotice = nil
 
         do {
             guard hasOpenAIAPIKey else {
@@ -269,12 +296,27 @@ struct ContentView: View {
 
             try setCategory(classification.category, for: chat, shouldSwitchCategory: true)
             classificationRationale = classification.rationale
-            errorMessage = nil
+            errorNotice = nil
         } catch {
-            errorMessage = String(describing: error)
+            presentError(error)
         }
 
         isCategorizing = false
+    }
+
+    private func loadMessages(for chat: ChatSummary) {
+        selectedChatMessages = []
+        isLoadingMessages = true
+        messageErrorNotice = nil
+
+        do {
+            let chatDatabase = try ChatDatabase()
+            selectedChatMessages = try chatDatabase.fetchMessages(for: chat.id, limit: messageDisplayLimit)
+        } catch {
+            messageErrorNotice = ErrorNotice(error)
+        }
+
+        isLoadingMessages = false
     }
 
     private func addTodo(title: String, chatGuid: String?) {
@@ -282,9 +324,9 @@ struct ContentView: View {
             let appDatabase = try AppDatabase()
             try appDatabase.addTodo(title: title, chatGuid: chatGuid)
             todos = try appDatabase.fetchTodos()
-            errorMessage = nil
+            errorNotice = nil
         } catch {
-            errorMessage = String(describing: error)
+            presentError(error)
         }
     }
 
@@ -293,9 +335,9 @@ struct ContentView: View {
             let appDatabase = try AppDatabase()
             try appDatabase.setTodoCompleted(!todo.isCompleted, id: todo.id)
             todos = try appDatabase.fetchTodos()
-            errorMessage = nil
+            errorNotice = nil
         } catch {
-            errorMessage = String(describing: error)
+            presentError(error)
         }
     }
 
@@ -304,10 +346,14 @@ struct ContentView: View {
             let appDatabase = try AppDatabase()
             try appDatabase.deleteTodo(id: todo.id)
             todos = try appDatabase.fetchTodos()
-            errorMessage = nil
+            errorNotice = nil
         } catch {
-            errorMessage = String(describing: error)
+            presentError(error)
         }
+    }
+
+    private func presentError(_ error: Error) {
+        errorNotice = ErrorNotice(error)
     }
 
     private static let dateFormatter: DateFormatter = {
@@ -316,6 +362,216 @@ struct ContentView: View {
         formatter.timeStyle = .none
         return formatter
     }()
+}
+
+private struct ErrorNotice: Identifiable {
+    let id: UUID
+    let title: String
+    let message: String
+    let recoverySuggestion: String?
+
+    init(title: String, message: String, recoverySuggestion: String? = nil) {
+        self.id = UUID()
+        self.title = title
+        self.message = message
+        self.recoverySuggestion = recoverySuggestion
+    }
+
+    init(_ error: Error) {
+        if let openAIError = error as? OpenAIClient.ClientError {
+            self = Self.openAI(openAIError)
+        } else if let chatDatabaseError = error as? ChatDatabase.DatabaseError {
+            self = Self.chatDatabase(chatDatabaseError)
+        } else if let appDatabaseError = error as? AppDatabase.DatabaseError {
+            self = Self.appDatabase(appDatabaseError)
+        } else if let keychainError = error as? KeychainError {
+            self = Self.keychain(keychainError)
+        } else if let urlError = error as? URLError {
+            self = Self.url(urlError)
+        } else {
+            self = ErrorNotice(
+                title: "Something went wrong",
+                message: Self.clean(Self.description(for: error))
+            )
+        }
+    }
+
+    private static func openAI(_ error: OpenAIClient.ClientError) -> ErrorNotice {
+        switch error {
+        case .missingAPIKey:
+            return ErrorNotice(
+                title: "OpenAI API key missing",
+                message: "Add your API key in Settings before categorizing conversations."
+            )
+        case .invalidResponse:
+            return ErrorNotice(
+                title: "OpenAI response was not readable",
+                message: "The request completed, but the app could not read the returned categorization."
+            )
+        case .invalidCategory(let category):
+            return ErrorNotice(
+                title: "OpenAI returned an unknown category",
+                message: "'\(category)' is not one of the categories this app supports."
+            )
+        case .requestFailed(let message):
+            let cleanMessage = cleanOpenAIMessage(message)
+            let lowercasedMessage = cleanMessage.lowercased()
+
+            if lowercasedMessage.contains("quota") || lowercasedMessage.contains("billing") {
+                return ErrorNotice(
+                    title: "OpenAI quota exceeded",
+                    message: "Your OpenAI account does not currently have enough API quota for this request.",
+                    recoverySuggestion: "Check your OpenAI plan and billing details, then try again."
+                )
+            }
+
+            if lowercasedMessage.contains("api key") || lowercasedMessage.contains("authentication") {
+                return ErrorNotice(
+                    title: "OpenAI authentication failed",
+                    message: cleanMessage,
+                    recoverySuggestion: "Check the API key saved in Settings."
+                )
+            }
+
+            return ErrorNotice(
+                title: "OpenAI request failed",
+                message: cleanMessage
+            )
+        }
+    }
+
+    private static func chatDatabase(_ error: ChatDatabase.DatabaseError) -> ErrorNotice {
+        switch error {
+        case .missingBundledDatabase:
+            return ErrorNotice(
+                title: "Message database missing",
+                message: "The app could not find the bundled chat.db file."
+            )
+        case .openFailed(let message):
+            return ErrorNotice(
+                title: "Could not open message database",
+                message: clean(message)
+            )
+        case .prepareFailed(let message):
+            return ErrorNotice(
+                title: "Could not read message database",
+                message: clean(message)
+            )
+        }
+    }
+
+    private static func appDatabase(_ error: AppDatabase.DatabaseError) -> ErrorNotice {
+        switch error {
+        case .applicationSupportDirectoryMissing:
+            return ErrorNotice(
+                title: "Application Support unavailable",
+                message: "The app could not locate your Application Support folder."
+            )
+        case .openFailed(let message):
+            return ErrorNotice(
+                title: "Could not open app database",
+                message: clean(message)
+            )
+        case .prepareFailed(let message), .stepFailed(let message):
+            return ErrorNotice(
+                title: "Could not update app data",
+                message: clean(message)
+            )
+        }
+    }
+
+    private static func keychain(_ error: KeychainError) -> ErrorNotice {
+        switch error {
+        case .unhandledStatus(let status):
+            return ErrorNotice(
+                title: "Could not update Keychain",
+                message: "macOS Keychain returned status \(status)."
+            )
+        }
+    }
+
+    private static func url(_ error: URLError) -> ErrorNotice {
+        ErrorNotice(
+            title: "Network request failed",
+            message: error.localizedDescription,
+            recoverySuggestion: "Check your network connection and try again."
+        )
+    }
+
+    private static func description(for error: Error) -> String {
+        let localizedDescription = error.localizedDescription
+        if localizedDescription.contains("The operation couldn't be completed")
+            || localizedDescription.contains("The operation couldn’t be completed") {
+            return String(describing: error)
+        }
+
+        return localizedDescription
+    }
+
+    private static func cleanOpenAIMessage(_ message: String) -> String {
+        let cleanMessage = clean(message)
+        guard let range = cleanMessage.range(of: " For more information", options: .caseInsensitive) else {
+            return cleanMessage
+        }
+
+        return String(cleanMessage[..<range.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func clean(_ message: String) -> String {
+        message
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\n", with: " ")
+    }
+}
+
+private struct ErrorNoticeView: View {
+    let notice: ErrorNotice
+    var onDismiss: (() -> Void)? = nil
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(notice.title)
+                    .font(.headline)
+
+                Text(notice.message)
+                    .textSelection(.enabled)
+                    .foregroundStyle(.primary)
+
+                if let recoverySuggestion = notice.recoverySuggestion {
+                    Text(recoverySuggestion)
+                        .textSelection(.enabled)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer()
+
+            if let onDismiss {
+                Button {
+                    onDismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Dismiss")
+            }
+        }
+        .font(.callout)
+        .padding(12)
+        .background(Color.red.opacity(0.08))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.red.opacity(0.24))
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
 }
 
 private struct ConversationSortPicker: View {
@@ -375,7 +631,14 @@ private struct ChatRow: View {
 
 private struct ConversationDetailView: View {
     let chat: ChatSummary
+    let messages: [ConversationMessage]
     let todos: [ConversationTodo]
+    let isLoadingMessages: Bool
+    let messageErrorNotice: ErrorNotice?
+    let messageLimit: Int
+    let onReloadMessages: () -> Void
+    let errorNotice: ErrorNotice?
+    let onDismissError: () -> Void
     let onCategoryChange: (RelationshipCategory) -> Void
     let onAddTodo: (String) -> Void
     let onToggleTodo: (ConversationTodo) -> Void
@@ -409,6 +672,20 @@ private struct ConversationDetailView: View {
                 }
                 .frame(width: 220)
             }
+
+            if let errorNotice {
+                ErrorNoticeView(notice: errorNotice, onDismiss: onDismissError)
+            }
+
+            ConversationMessagesView(
+                messages: messages,
+                isLoading: isLoadingMessages,
+                errorNotice: messageErrorNotice,
+                messageLimit: messageLimit,
+                participantCount: chat.participantCount,
+                onReload: onReloadMessages
+            )
+            .frame(minHeight: 220, maxHeight: 320)
 
             VStack(alignment: .leading, spacing: 10) {
                 Text("LLM Categorization")
@@ -455,6 +732,122 @@ private struct ConversationDetailView: View {
         }
         .padding()
     }
+}
+
+private struct ConversationMessagesView: View {
+    let messages: [ConversationMessage]
+    let isLoading: Bool
+    let errorNotice: ErrorNotice?
+    let messageLimit: Int
+    let participantCount: Int
+    let onReload: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Messages")
+                        .font(.headline)
+
+                    Text("Showing latest \(messageLimit) text messages and attachments.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Button("Reload", action: onReload)
+                    .disabled(isLoading)
+            }
+
+            if isLoading {
+                ProgressView("Loading messages...")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let errorNotice {
+                ErrorNoticeView(notice: errorNotice)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            } else if messages.isEmpty {
+                ContentUnavailableView("No text messages", systemImage: "message")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 10) {
+                            ForEach(messages) { message in
+                                MessageBubbleView(
+                                    message: message,
+                                    showSender: participantCount > 1
+                                )
+                                .id(message.id)
+                            }
+                        }
+                        .padding(.vertical, 6)
+                    }
+                    .background(Color.secondary.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .onAppear {
+                        scrollToLatestMessage(using: proxy)
+                    }
+                }
+            }
+        }
+    }
+
+    private func scrollToLatestMessage(using proxy: ScrollViewProxy) {
+        guard let lastMessageID = messages.last?.id else {
+            return
+        }
+
+        proxy.scrollTo(lastMessageID, anchor: .bottom)
+    }
+}
+
+private struct MessageBubbleView: View {
+    let message: ConversationMessage
+    let showSender: Bool
+
+    var body: some View {
+        HStack(alignment: .bottom) {
+            if message.isFromMe {
+                Spacer(minLength: 80)
+            }
+
+            VStack(alignment: message.isFromMe ? .trailing : .leading, spacing: 4) {
+                if !message.isFromMe && showSender, let senderHandle = message.senderHandle {
+                    Text(senderHandle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+
+                Text(message.text)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(message.isFromMe ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.14))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                if let date = message.date {
+                    Text(Self.dateFormatter.string(from: date))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: 560, alignment: message.isFromMe ? .trailing : .leading)
+
+            if !message.isFromMe {
+                Spacer(minLength: 80)
+            }
+        }
+        .padding(.horizontal, 10)
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter
+    }()
 }
 
 private struct TodoListView: View {
