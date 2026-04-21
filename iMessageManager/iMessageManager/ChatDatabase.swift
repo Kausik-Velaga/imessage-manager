@@ -440,6 +440,10 @@ final class ChatDatabase {
             return nil
         }
 
+        if let text = legacyAttributedBodyText(data) {
+            return text
+        }
+
         let allowedClasses: [AnyClass] = [
             NSAttributedString.self,
             NSMutableAttributedString.self,
@@ -462,6 +466,32 @@ final class ChatDatabase {
         }
 
         return archivedAttributedStringText(data)
+    }
+
+    private static func legacyAttributedBodyText(_ data: Data) -> String? {
+        guard isTypedStream(data),
+              let object = NSUnarchiver.unarchiveObject(with: data) else {
+            return nil
+        }
+
+        if let attributedString = object as? NSAttributedString {
+            return nonEmpty(attributedString.string)
+        }
+
+        if let string = object as? String {
+            return nonEmpty(string)
+        }
+
+        return nil
+    }
+
+    private static func isTypedStream(_ data: Data) -> Bool {
+        guard let marker = "streamtyped".data(using: .ascii) else {
+            return false
+        }
+
+        let searchRange = data.startIndex..<min(data.endIndex, data.startIndex + 32)
+        return data.range(of: marker, options: [], in: searchRange) != nil
     }
 
     private static func archivedAttributedStringText(_ data: Data) -> String? {
@@ -537,7 +567,9 @@ final class ChatDatabase {
     }
 
     private static func nonEmpty(_ value: String?) -> String? {
-        guard let trimmedValue = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+        guard let trimmedValue = value?
+            .replacingOccurrences(of: "\u{fffc}", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines),
               !trimmedValue.isEmpty else {
             return nil
         }
