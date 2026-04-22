@@ -1,4 +1,49 @@
-# SQLite files
+# macOS local files
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# Local message database copies
 chat.db
 chat.db-shm
 chat.db-wal
+*.db
+*.db-shm
+*.db-wal
+
+# Xcode user/local state
+xcuserdata/
+**/xcuserdata/
+*.xcuserstate
+*.xcuserdatad/
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+*.xcdebugger/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+
+# Xcode build products and results
+DerivedData/
+build/
+Build/
+*.xcresult
+*.xcarchive
+*.dSYM
+*.dSYM.zip
+*.ipa
+
+# Coverage and compiler artifacts
+*.gcda
+*.gcno
+*.profdata
+
+# SwiftPM/local build artifacts
+.build/
+.swiftpm/

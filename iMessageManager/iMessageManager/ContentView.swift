@@ -1,0 +1,1508 @@
+import SwiftUI
+
+struct ContentView: View {
+    @State private var chats: [ChatSummary] = []
+    @State private var todos: [ConversationTodo] = []
+    @State private var selectedChatID: ChatSummary.ID?
+    @State private var selectedCategory: RelationshipCategory = .unknown
+    @State private var conversationSort: ConversationSort = .latest
+    @State private var selectedChatMessages: [ConversationMessage] = []
+    @State private var isLoadingMessages = false
+    @State private var messageErrorNotice: ErrorNotice?
+    @State private var openAIAPIKey = ""
+    @State private var isCategorizing = false
+    @State private var isEstimatingCategorizationCost = false
+    @State private var isCategorizingAll = false
+    @State private var isConfirmingBulkCategorization = false
+    @State private var shouldCancelBulkCategorization = false
+    @State private var categorizationCostEstimate: CategorizationCostEstimate?
+    @State private var selectedChatCategorizationCostEstimate: CategorizationCostEstimate?
+    @State private var bulkCategorizationProgress = BulkCategorizationProgress()
+    @State private var bulkCategorizationSpendLimitText = "1.00"
+    @State private var bulkCategorizationMessage: String?
+    @State private var bulkCategorizationScope: BulkCategorizationScope = .uncategorized
+    @State private var estimatedBulkCategorizationScope: BulkCategorizationScope?
+    @State private var estimatedBulkCategorizationTargetIDs: Set<ChatSummary.ID> = []
+    @State private var classificationRationale: String?
+    @State private var settingsMessage: String?
+    @State private var errorNotice: ErrorNotice?
+
+    private let messageDisplayLimit = 200
+    private let categorizationSampleLimit = 30
+
+    private var selectedChat: ChatSummary? {
+        chats.first { $0.id == selectedChatID }
+    }
+
+    private var chatNamesByGuid: [String: String] {
+        Dictionary(uniqueKeysWithValues: chats.map { ($0.guid, $0.displayName) })
+    }
+
+    private var hasOpenAIAPIKey: Bool {
+        !openAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var bulkCategorizationSpendLimit: Double? {
+        let normalizedValue = bulkCategorizationSpendLimitText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "$", with: "")
+            .replacingOccurrences(of: ",", with: "")
+
+        return Double(normalizedValue)
+    }
+
+    private var bulkCategorizationTargetChats: [ChatSummary] {
+        switch bulkCategorizationScope {
+        case .uncategorized:
+            return chats.filter { $0.relationshipCategory == .unknown }
+        case .all:
+            return chats
+        }
+    }
+
+    private var bulkCategorizationTargetIDs: Set<ChatSummary.ID> {
+        Set(bulkCategorizationTargetChats.map(\.id))
+    }
+
+    private var bulkCategorizationDisabledReason: String? {
+        if isCategorizingAll {
+            return "Bulk categorization is already running."
+        }
+
+        if isCategorizing {
+            return "Wait for the current conversation categorization to finish."
+        }
+
+        if !hasOpenAIAPIKey {
+            return "Save your OpenAI API key first."
+        }
+
+        if chats.isEmpty {
+            return "No conversations are loaded."
+        }
+
+        if bulkCategorizationTargetChats.isEmpty {
+            return "No conversations match the selected scope."
+        }
+
+        guard let estimate = categorizationCostEstimate else {
+            return "Estimate the cost first."
+        }
+
+        if estimatedBulkCategorizationScope != bulkCategorizationScope
+            || estimatedBulkCategorizationTargetIDs != bulkCategorizationTargetIDs {
+            return "Re-estimate after changing scope or categories."
+        }
+
+        guard let spendLimit = bulkCategorizationSpendLimit else {
+            return "Enter a valid max estimated spend."
+        }
+
+        if estimate.standardCost > spendLimit {
+            return "Estimated standard cost exceeds your max spend."
+        }
+
+        return nil
+    }
+
+    private var bulkCategorizationConfirmationMessage: String {
+        let estimatedCost = categorizationCostEstimate.map { CostEstimateFormat.currency($0.standardCost) } ?? "unknown"
+        let scopeMessage: String
+
+        switch bulkCategorizationScope {
+        case .uncategorized:
+            scopeMessage = "This will only categorize conversations currently in Unknown. Existing non-Unknown categories will be left alone."
+        case .all:
+            scopeMessage = "This will recategorize every conversation and overwrite existing categories."
+        }
+
+        return """
+        This will send up to \(categorizationSampleLimit) recent messages from each of \(bulkCategorizationTargetChats.count) conversations to OpenAI. \(scopeMessage) Estimated standard cost: \(estimatedCost).
+        """
+    }
+
+    private var bulkCategorizationAlertTitle: String {
+        switch bulkCategorizationScope {
+        case .uncategorized:
+            return "Categorize unknown conversations?"
+        case .all:
+            return "Categorize all conversations?"
+        }
+    }
+
+    private var bulkCategorizationButtonTitle: String {
+        switch bulkCategorizationScope {
+        case .uncategorized:
+            return "Categorize Unknown Conversations"
+        case .all:
+            return "Categorize All Conversations"
+        }
+    }
+
+    var body: some View {
+        TabView {
+            categoriesView
+                .tabItem {
+                    Label("Categories", systemImage: "person.2")
+                }
+
+            statisticsView
+                .tabItem {
+                    Label("Statistics", systemImage: "chart.bar")
+                }
+
+            todosView
+                .tabItem {
+                    Label("Todos", systemImage: "checklist")
+                }
+
+            settingsView
+                .tabItem {
+                    Label("Settings", systemImage: "gear")
+                }
+        }
+        .frame(minWidth: 900, minHeight: 600)
+        .task {
+            await loadData()
+        }
+    }
+
+    private var categoriesView: some View {
+        NavigationSplitView {
+            VStack(alignment: .leading, spacing: 12) {
+                Picker("Category", selection: $selectedCategory) {
+                    ForEach(RelationshipCategory.allCases) { category in
+                        Text(category.displayName).tag(category)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .padding([.horizontal, .top])
+
+                ConversationSortPicker(selection: $conversationSort)
+                .padding(.horizontal)
+
+                List(filteredChats, selection: $selectedChatID) { chat in
+                    ChatRow(chat: chat)
+                }
+                .navigationTitle("Conversations")
+            }
+        } detail: {
+            if let selectedChat {
+                ConversationDetailView(
+                    chat: selectedChat,
+                    messages: selectedChatMessages,
+                    todos: todos.filter { $0.chatGuid == selectedChat.guid },
+                    isLoadingMessages: isLoadingMessages,
+                    messageErrorNotice: messageErrorNotice,
+                    messageLimit: messageDisplayLimit,
+                    onReloadMessages: {
+                        loadConversationDetails(for: selectedChat)
+                    },
+                    errorNotice: errorNotice,
+                    onDismissError: {
+                        errorNotice = nil
+                    },
+                    onCategoryChange: { category in
+                        setCategory(category, for: selectedChat)
+                    },
+                    onAddTodo: { title in
+                        addTodo(title: title, chatGuid: selectedChat.guid)
+                    },
+                    onToggleTodo: toggleTodo,
+                    onDeleteTodo: deleteTodo,
+                    hasOpenAIAPIKey: hasOpenAIAPIKey,
+                    isCategorizing: isCategorizing || isCategorizingAll,
+                    categorizationCostEstimate: selectedChatCategorizationCostEstimate,
+                    classificationRationale: classificationRationale,
+                    onCategorizeWithLLM: {
+                        Task {
+                            await categorizeWithLLM(selectedChat)
+                        }
+                    }
+                )
+                .task(id: selectedChat.id) {
+                    loadConversationDetails(for: selectedChat)
+                }
+            } else if let errorNotice {
+                ErrorNoticeView(notice: errorNotice) {
+                    self.errorNotice = nil
+                }
+                .padding()
+            } else {
+                ContentUnavailableView("Select a conversation", systemImage: "message")
+            }
+        }
+    }
+
+    private var statisticsView: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ConversationSortPicker(selection: $conversationSort)
+                .padding([.horizontal, .top])
+
+            List(sortedChats(chats)) { chat in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text(chat.displayName)
+                            .font(.headline)
+                        Spacer()
+                        Text(chat.relationshipCategory.displayName)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    HStack(spacing: 16) {
+                        StatLabel(title: "Messages", value: "\(chat.messageCount)")
+                        StatLabel(title: "Sent", value: "\(chat.sentCount)")
+                        StatLabel(title: "Received", value: "\(chat.receivedCount)")
+                        StatLabel(title: "Monthly", value: chat.messagesPerMonth.formatted(.number.precision(.fractionLength(1))))
+
+                        if let lastInteractionDate = chat.lastInteractionDate {
+                            StatLabel(title: "Last", value: Self.dateFormatter.string(from: lastInteractionDate))
+                        }
+                    }
+                    .font(.caption)
+                }
+                .padding(.vertical, 4)
+            }
+        }
+        .navigationTitle("Statistics")
+    }
+
+    private var todosView: some View {
+        TodoListView(
+            title: "All Todos",
+            todos: todos,
+            chatNamesByGuid: chatNamesByGuid,
+            onAddTodo: { title in
+                addTodo(title: title, chatGuid: nil)
+            },
+            onToggleTodo: toggleTodo,
+            onDeleteTodo: deleteTodo
+        )
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var settingsView: some View {
+        Form {
+            Section("OpenAI") {
+                SecureField("API key", text: $openAIAPIKey)
+
+                HStack {
+                    Button("Save Key", action: saveOpenAIAPIKey)
+
+                    Button("Clear Key") {
+                        openAIAPIKey = ""
+                        saveOpenAIAPIKey()
+                    }
+                }
+
+                Text("Used globally for LLM categorization. Conversation text is only sent when you categorize a conversation or start bulk categorization.")
+                    .foregroundStyle(.secondary)
+
+                if let settingsMessage {
+                    Text(settingsMessage)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let errorNotice {
+                    ErrorNoticeView(notice: errorNotice) {
+                        self.errorNotice = nil
+                    }
+                }
+            }
+
+            Section("Bulk Categorization") {
+                Text("Estimate first, then categorize conversations sequentially.")
+                    .foregroundStyle(.secondary)
+
+                Picker("Scope", selection: Binding(
+                    get: { bulkCategorizationScope },
+                    set: { newScope in
+                        bulkCategorizationScope = newScope
+                        bulkCategorizationMessage = nil
+                    }
+                )) {
+                    ForEach(BulkCategorizationScope.allCases) { scope in
+                        Text(scope.displayName).tag(scope)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .disabled(isCategorizingAll)
+
+                Text(bulkCategorizationScope.explanation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Button {
+                    estimateCategorizationCost()
+                } label: {
+                    if isEstimatingCategorizationCost {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Text("Estimate Selected Scope")
+                    }
+                }
+                .disabled(isEstimatingCategorizationCost || isCategorizingAll || bulkCategorizationTargetChats.isEmpty)
+
+                if let categorizationCostEstimate {
+                    CategorizationCostEstimateView(estimate: categorizationCostEstimate)
+                }
+
+                Divider()
+
+                HStack {
+                    Text("Max estimated spend")
+
+                    TextField("1.00", text: $bulkCategorizationSpendLimitText)
+                        .frame(width: 80)
+
+                    Text("USD")
+                        .foregroundStyle(.secondary)
+                }
+
+                Button {
+                    prepareBulkCategorization()
+                } label: {
+                    if isCategorizingAll {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Text(bulkCategorizationButtonTitle)
+                    }
+                }
+                .disabled(bulkCategorizationDisabledReason != nil)
+
+                if let bulkCategorizationDisabledReason, !isCategorizingAll {
+                    Text(bulkCategorizationDisabledReason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if bulkCategorizationProgress.hasStarted {
+                    BulkCategorizationProgressView(
+                        progress: bulkCategorizationProgress,
+                        isRunning: isCategorizingAll,
+                        onCancel: cancelBulkCategorization
+                    )
+                }
+
+                if let bulkCategorizationMessage {
+                    Text(bulkCategorizationMessage)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .padding()
+        .alert(bulkCategorizationAlertTitle, isPresented: $isConfirmingBulkCategorization) {
+            Button(bulkCategorizationButtonTitle, role: .destructive) {
+                Task {
+                    await categorizeAllConversations()
+                }
+            }
+
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(bulkCategorizationConfirmationMessage)
+        }
+    }
+
+    private var filteredChats: [ChatSummary] {
+        sortedChats(chats.filter { $0.relationshipCategory == selectedCategory })
+    }
+
+    private func loadData() async {
+        do {
+            let appDatabase = try AppDatabase()
+            let categories = try appDatabase.fetchCategories()
+            openAIAPIKey = KeychainStore.openAIAPIKey() ?? ""
+            let contactResolver = await ContactResolver.load()
+            let chatDatabase = try ChatDatabase()
+            chats = try chatDatabase.fetchChats(
+                categories: categories,
+                contactResolver: contactResolver
+            )
+            todos = try appDatabase.fetchTodos()
+            errorNotice = nil
+        } catch {
+            presentError(error)
+        }
+    }
+
+    private func sortedChats(_ chats: [ChatSummary]) -> [ChatSummary] {
+        switch conversationSort {
+        case .latest:
+            return chats.sorted {
+                ($0.lastInteractionDate ?? .distantPast) > ($1.lastInteractionDate ?? .distantPast)
+            }
+        case .earliest:
+            return chats.sorted {
+                ($0.lastInteractionDate ?? .distantFuture) < ($1.lastInteractionDate ?? .distantFuture)
+            }
+        case .name:
+            return chats.sorted {
+                $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+            }
+        case .mostMessages:
+            return chats.sorted {
+                $0.messageCount > $1.messageCount
+            }
+        }
+    }
+
+    private func setCategory(_ category: RelationshipCategory, for chat: ChatSummary) {
+        do {
+            try setCategory(category, for: chat, shouldSwitchCategory: true)
+            errorNotice = nil
+        } catch {
+            presentError(error)
+        }
+    }
+
+    private func setCategory(_ category: RelationshipCategory, for chat: ChatSummary, shouldSwitchCategory: Bool) throws {
+        let appDatabase = try AppDatabase()
+        try appDatabase.setCategory(category, for: chat.guid)
+
+        if let index = chats.firstIndex(where: { $0.id == chat.id }) {
+            chats[index].relationshipCategory = category
+        }
+
+        if shouldSwitchCategory {
+            selectedCategory = category
+        }
+    }
+
+    private func saveOpenAIAPIKey() {
+        do {
+            try KeychainStore.setOpenAIAPIKey(openAIAPIKey)
+            settingsMessage = hasOpenAIAPIKey ? "OpenAI API key saved." : "OpenAI API key cleared."
+            errorNotice = nil
+        } catch {
+            settingsMessage = nil
+            presentError(error)
+        }
+    }
+
+    private func categorizeWithLLM(_ chat: ChatSummary) async {
+        isCategorizing = true
+        classificationRationale = nil
+        errorNotice = nil
+
+        do {
+            guard hasOpenAIAPIKey else {
+                throw OpenAIClient.ClientError.missingAPIKey
+            }
+
+            let chatDatabase = try ChatDatabase()
+            let messages = try chatDatabase.fetchMessageSamples(for: chat.id, limit: categorizationSampleLimit)
+            let client = OpenAIClient(apiKey: openAIAPIKey)
+            let classification = try await client.classifyConversation(chat: chat, messages: messages)
+
+            try setCategory(classification.category, for: chat, shouldSwitchCategory: true)
+            classificationRationale = classification.rationale
+            errorNotice = nil
+        } catch {
+            presentError(error)
+        }
+
+        isCategorizing = false
+    }
+
+    private func estimateCategorizationCost() {
+        isEstimatingCategorizationCost = true
+        errorNotice = nil
+
+        do {
+            let chatsToEstimate = bulkCategorizationTargetChats
+            let chatDatabase = try ChatDatabase()
+            categorizationCostEstimate = try CategorizationCostEstimator.estimate(
+                chats: chatsToEstimate,
+                chatDatabase: chatDatabase,
+                sampleMessageLimit: categorizationSampleLimit
+            )
+            estimatedBulkCategorizationScope = bulkCategorizationScope
+            estimatedBulkCategorizationTargetIDs = Set(chatsToEstimate.map(\.id))
+        } catch {
+            categorizationCostEstimate = nil
+            estimatedBulkCategorizationScope = nil
+            estimatedBulkCategorizationTargetIDs = []
+            presentError(error)
+        }
+
+        isEstimatingCategorizationCost = false
+    }
+
+    private func prepareBulkCategorization() {
+        if categorizationCostEstimate == nil {
+            estimateCategorizationCost()
+        }
+
+        guard bulkCategorizationDisabledReason == nil else {
+            return
+        }
+
+        isConfirmingBulkCategorization = true
+    }
+
+    private func categorizeAllConversations() async {
+        guard !isCategorizingAll else {
+            return
+        }
+
+        isCategorizingAll = true
+        shouldCancelBulkCategorization = false
+        bulkCategorizationMessage = nil
+        errorNotice = nil
+
+        let chatsToCategorize = sortedChats(bulkCategorizationTargetChats)
+        bulkCategorizationProgress = BulkCategorizationProgress(total: chatsToCategorize.count)
+
+        defer {
+            isCategorizingAll = false
+            shouldCancelBulkCategorization = false
+            bulkCategorizationProgress.isCancelling = false
+            bulkCategorizationProgress.currentConversation = nil
+        }
+
+        do {
+            guard hasOpenAIAPIKey else {
+                throw OpenAIClient.ClientError.missingAPIKey
+            }
+
+            guard let estimate = categorizationCostEstimate else {
+                throw BulkCategorizationError.missingCostEstimate
+            }
+
+            let targetIDs = Set(chatsToCategorize.map(\.id))
+
+            guard estimatedBulkCategorizationScope == bulkCategorizationScope,
+                  estimatedBulkCategorizationTargetIDs == targetIDs else {
+                throw BulkCategorizationError.staleCostEstimate
+            }
+
+            guard let spendLimit = bulkCategorizationSpendLimit else {
+                throw BulkCategorizationError.invalidSpendLimit
+            }
+
+            guard estimate.standardCost <= spendLimit else {
+                throw BulkCategorizationError.estimatedCostExceeded(
+                    estimate: estimate.standardCost,
+                    limit: spendLimit
+                )
+            }
+
+            let chatDatabase = try ChatDatabase()
+            let appDatabase = try AppDatabase()
+            let client = OpenAIClient(apiKey: openAIAPIKey)
+
+            bulkCategorizationProgress.total = chatsToCategorize.count
+
+            for chat in chatsToCategorize {
+                if shouldCancelBulkCategorization {
+                    bulkCategorizationProgress.isCancelling = true
+                    break
+                }
+
+                bulkCategorizationProgress.currentConversation = chat.displayName
+                var stopError: Error?
+
+                do {
+                    let messages = try chatDatabase.fetchMessageSamples(for: chat.id, limit: categorizationSampleLimit)
+                    let classification = try await client.classifyConversation(chat: chat, messages: messages)
+
+                    try appDatabase.setCategory(classification.category, for: chat.guid)
+
+                    if let index = chats.firstIndex(where: { $0.id == chat.id }) {
+                        chats[index].relationshipCategory = classification.category
+                    }
+
+                    bulkCategorizationProgress.categorized += 1
+                } catch {
+                    bulkCategorizationProgress.failed += 1
+                    bulkCategorizationProgress.failureMessages.append(Self.bulkFailureSummary(for: chat, error: error))
+
+                    if shouldStopBulkCategorization(after: error) {
+                        stopError = error
+                    }
+                }
+
+                bulkCategorizationProgress.completed += 1
+
+                if let stopError {
+                    throw stopError
+                }
+            }
+
+            if bulkCategorizationProgress.isCancelling {
+                bulkCategorizationMessage = "Bulk categorization cancelled after \(bulkCategorizationProgress.completed) of \(bulkCategorizationProgress.total) conversations."
+            } else {
+                bulkCategorizationMessage = "Bulk categorization finished: \(bulkCategorizationProgress.categorized) categorized, \(bulkCategorizationProgress.failed) failed."
+            }
+        } catch {
+            bulkCategorizationMessage = "Bulk categorization stopped after \(bulkCategorizationProgress.completed) of \(bulkCategorizationProgress.total) conversations."
+            presentError(error)
+        }
+    }
+
+    private func cancelBulkCategorization() {
+        shouldCancelBulkCategorization = true
+        bulkCategorizationProgress.isCancelling = true
+    }
+
+    private func shouldStopBulkCategorization(after error: Error) -> Bool {
+        if error is URLError || error is ChatDatabase.DatabaseError || error is AppDatabase.DatabaseError {
+            return true
+        }
+
+        guard let openAIError = error as? OpenAIClient.ClientError else {
+            return false
+        }
+
+        switch openAIError {
+        case .missingAPIKey, .requestFailed:
+            return true
+        case .invalidResponse, .invalidCategory:
+            return false
+        }
+    }
+
+    private static func bulkFailureSummary(for chat: ChatSummary, error: Error) -> String {
+        let notice = ErrorNotice(error)
+        return "\(chat.displayName): \(notice.title)"
+    }
+
+    private func loadConversationDetails(for chat: ChatSummary) {
+        selectedChatMessages = []
+        selectedChatCategorizationCostEstimate = nil
+        isLoadingMessages = true
+        messageErrorNotice = nil
+
+        do {
+            let chatDatabase = try ChatDatabase()
+            selectedChatMessages = try chatDatabase.fetchMessages(for: chat.id, limit: messageDisplayLimit)
+            let sampleMessages = try chatDatabase.fetchMessageSamples(for: chat.id, limit: categorizationSampleLimit)
+            selectedChatCategorizationCostEstimate = CategorizationCostEstimator.estimate(
+                chat: chat,
+                messages: sampleMessages,
+                sampleMessageLimit: categorizationSampleLimit
+            )
+        } catch {
+            messageErrorNotice = ErrorNotice(error)
+        }
+
+        isLoadingMessages = false
+    }
+
+    private func addTodo(title: String, chatGuid: String?) {
+        do {
+            let appDatabase = try AppDatabase()
+            try appDatabase.addTodo(title: title, chatGuid: chatGuid)
+            todos = try appDatabase.fetchTodos()
+            errorNotice = nil
+        } catch {
+            presentError(error)
+        }
+    }
+
+    private func toggleTodo(_ todo: ConversationTodo) {
+        do {
+            let appDatabase = try AppDatabase()
+            try appDatabase.setTodoCompleted(!todo.isCompleted, id: todo.id)
+            todos = try appDatabase.fetchTodos()
+            errorNotice = nil
+        } catch {
+            presentError(error)
+        }
+    }
+
+    private func deleteTodo(_ todo: ConversationTodo) {
+        do {
+            let appDatabase = try AppDatabase()
+            try appDatabase.deleteTodo(id: todo.id)
+            todos = try appDatabase.fetchTodos()
+            errorNotice = nil
+        } catch {
+            presentError(error)
+        }
+    }
+
+    private func presentError(_ error: Error) {
+        errorNotice = ErrorNotice(error)
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        return formatter
+    }()
+}
+
+private enum BulkCategorizationScope: String, CaseIterable, Identifiable {
+    case uncategorized
+    case all
+
+    var id: Self {
+        self
+    }
+
+    var displayName: String {
+        switch self {
+        case .uncategorized:
+            return "Uncategorized"
+        case .all:
+            return "All"
+        }
+    }
+
+    var explanation: String {
+        switch self {
+        case .uncategorized:
+            return "Only conversations currently in Unknown will be categorized. Existing categories are preserved."
+        case .all:
+            return "Every conversation will be categorized again, regardless of its current category."
+        }
+    }
+}
+
+private enum BulkCategorizationError: Error {
+    case missingCostEstimate
+    case staleCostEstimate
+    case invalidSpendLimit
+    case estimatedCostExceeded(estimate: Double, limit: Double)
+}
+
+private struct BulkCategorizationProgress {
+    var total = 0
+    var completed = 0
+    var categorized = 0
+    var failed = 0
+    var currentConversation: String?
+    var failureMessages: [String] = []
+    var isCancelling = false
+
+    var hasStarted: Bool {
+        total > 0 || completed > 0 || categorized > 0 || failed > 0
+    }
+}
+
+private struct ErrorNotice: Identifiable {
+    let id: UUID
+    let title: String
+    let message: String
+    let recoverySuggestion: String?
+
+    init(title: String, message: String, recoverySuggestion: String? = nil) {
+        self.id = UUID()
+        self.title = title
+        self.message = message
+        self.recoverySuggestion = recoverySuggestion
+    }
+
+    init(_ error: Error) {
+        if let openAIError = error as? OpenAIClient.ClientError {
+            self = Self.openAI(openAIError)
+        } else if let chatDatabaseError = error as? ChatDatabase.DatabaseError {
+            self = Self.chatDatabase(chatDatabaseError)
+        } else if let appDatabaseError = error as? AppDatabase.DatabaseError {
+            self = Self.appDatabase(appDatabaseError)
+        } else if let bulkCategorizationError = error as? BulkCategorizationError {
+            self = Self.bulkCategorization(bulkCategorizationError)
+        } else if let keychainError = error as? KeychainError {
+            self = Self.keychain(keychainError)
+        } else if let urlError = error as? URLError {
+            self = Self.url(urlError)
+        } else {
+            self = ErrorNotice(
+                title: "Something went wrong",
+                message: Self.clean(Self.description(for: error))
+            )
+        }
+    }
+
+    private static func bulkCategorization(_ error: BulkCategorizationError) -> ErrorNotice {
+        switch error {
+        case .missingCostEstimate:
+            return ErrorNotice(
+                title: "Cost estimate missing",
+                message: "Estimate the categorization cost before starting a bulk run."
+            )
+        case .staleCostEstimate:
+            return ErrorNotice(
+                title: "Cost estimate is stale",
+                message: "Re-estimate after changing scope or categories, then start the bulk run again."
+            )
+        case .invalidSpendLimit:
+            return ErrorNotice(
+                title: "Max spend is invalid",
+                message: "Enter a valid dollar amount before starting a bulk run."
+            )
+        case .estimatedCostExceeded(let estimate, let limit):
+            return ErrorNotice(
+                title: "Estimated cost exceeds max spend",
+                message: "Estimated standard cost is \(CostEstimateFormat.currency(estimate)), above your \(CostEstimateFormat.currency(limit)) max."
+            )
+        }
+    }
+
+    private static func openAI(_ error: OpenAIClient.ClientError) -> ErrorNotice {
+        switch error {
+        case .missingAPIKey:
+            return ErrorNotice(
+                title: "OpenAI API key missing",
+                message: "Add your API key in Settings before categorizing conversations."
+            )
+        case .invalidResponse:
+            return ErrorNotice(
+                title: "OpenAI response was not readable",
+                message: "The request completed, but the app could not read the returned categorization."
+            )
+        case .invalidCategory(let category):
+            return ErrorNotice(
+                title: "OpenAI returned an unknown category",
+                message: "'\(category)' is not one of the categories this app supports."
+            )
+        case .requestFailed(let message):
+            let cleanMessage = cleanOpenAIMessage(message)
+            let lowercasedMessage = cleanMessage.lowercased()
+
+            if lowercasedMessage.contains("quota") || lowercasedMessage.contains("billing") {
+                return ErrorNotice(
+                    title: "OpenAI quota exceeded",
+                    message: "Your OpenAI account does not currently have enough API quota for this request.",
+                    recoverySuggestion: "Check your OpenAI plan and billing details, then try again."
+                )
+            }
+
+            if lowercasedMessage.contains("api key") || lowercasedMessage.contains("authentication") {
+                return ErrorNotice(
+                    title: "OpenAI authentication failed",
+                    message: cleanMessage,
+                    recoverySuggestion: "Check the API key saved in Settings."
+                )
+            }
+
+            return ErrorNotice(
+                title: "OpenAI request failed",
+                message: cleanMessage
+            )
+        }
+    }
+
+    private static func chatDatabase(_ error: ChatDatabase.DatabaseError) -> ErrorNotice {
+        switch error {
+        case .missingBundledDatabase:
+            return ErrorNotice(
+                title: "Message database missing",
+                message: "The app could not find the bundled chat.db file."
+            )
+        case .openFailed(let message):
+            return ErrorNotice(
+                title: "Could not open message database",
+                message: clean(message)
+            )
+        case .prepareFailed(let message):
+            return ErrorNotice(
+                title: "Could not read message database",
+                message: clean(message)
+            )
+        }
+    }
+
+    private static func appDatabase(_ error: AppDatabase.DatabaseError) -> ErrorNotice {
+        switch error {
+        case .applicationSupportDirectoryMissing:
+            return ErrorNotice(
+                title: "Application Support unavailable",
+                message: "The app could not locate your Application Support folder."
+            )
+        case .openFailed(let message):
+            return ErrorNotice(
+                title: "Could not open app database",
+                message: clean(message)
+            )
+        case .prepareFailed(let message), .stepFailed(let message):
+            return ErrorNotice(
+                title: "Could not update app data",
+                message: clean(message)
+            )
+        }
+    }
+
+    private static func keychain(_ error: KeychainError) -> ErrorNotice {
+        switch error {
+        case .unhandledStatus(let status):
+            return ErrorNotice(
+                title: "Could not update Keychain",
+                message: "macOS Keychain returned status \(status)."
+            )
+        }
+    }
+
+    private static func url(_ error: URLError) -> ErrorNotice {
+        ErrorNotice(
+            title: "Network request failed",
+            message: error.localizedDescription,
+            recoverySuggestion: "Check your network connection and try again."
+        )
+    }
+
+    private static func description(for error: Error) -> String {
+        let localizedDescription = error.localizedDescription
+        if localizedDescription.contains("The operation couldn't be completed")
+            || localizedDescription.contains("The operation couldn’t be completed") {
+            return String(describing: error)
+        }
+
+        return localizedDescription
+    }
+
+    private static func cleanOpenAIMessage(_ message: String) -> String {
+        let cleanMessage = clean(message)
+        guard let range = cleanMessage.range(of: " For more information", options: .caseInsensitive) else {
+            return cleanMessage
+        }
+
+        return String(cleanMessage[..<range.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func clean(_ message: String) -> String {
+        message
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\n", with: " ")
+    }
+}
+
+private struct ErrorNoticeView: View {
+    let notice: ErrorNotice
+    var onDismiss: (() -> Void)? = nil
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.red)
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(notice.title)
+                    .font(.headline)
+
+                Text(notice.message)
+                    .textSelection(.enabled)
+                    .foregroundStyle(.primary)
+
+                if let recoverySuggestion = notice.recoverySuggestion {
+                    Text(recoverySuggestion)
+                        .textSelection(.enabled)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Spacer()
+
+            if let onDismiss {
+                Button {
+                    onDismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Dismiss")
+            }
+        }
+        .font(.callout)
+        .padding(12)
+        .background(Color.red.opacity(0.08))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.red.opacity(0.24))
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct CategorizationCostEstimateView: View {
+    let estimate: CategorizationCostEstimate
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("No API calls were made.")
+                .font(.headline)
+
+            Text("Estimate uses \(estimate.modelName), the latest \(estimate.sampleMessageLimit) messages per conversation, and a conservative output allowance.")
+                .foregroundStyle(.secondary)
+
+            Divider()
+
+            LabeledContent("Conversations", value: estimate.totalConversations.formatted())
+            LabeledContent("With message samples", value: estimate.conversationsWithMessageSamples.formatted())
+            LabeledContent("Sample messages", value: estimate.totalSampleMessages.formatted())
+            LabeledContent("Estimated input tokens", value: estimate.estimatedInputTokens.formatted())
+            LabeledContent("Estimated output tokens", value: estimate.estimatedOutputTokens.formatted())
+
+            Divider()
+
+            LabeledContent("Estimated standard cost", value: CostEstimateFormat.currency(estimate.standardCost))
+                .font(.headline)
+            LabeledContent("Estimated Batch API cost", value: CostEstimateFormat.currency(estimate.batchCost))
+
+            Text("This workflow uses standard API calls so progress stays visible. Batch API would be cheaper but asynchronous.")
+                .foregroundStyle(.secondary)
+        }
+        .padding(.top, 4)
+    }
+}
+
+private struct BulkCategorizationProgressView: View {
+    let progress: BulkCategorizationProgress
+    let isRunning: Bool
+    let onCancel: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ProgressView(
+                value: Double(progress.completed),
+                total: Double(max(progress.total, 1))
+            )
+
+            HStack(spacing: 16) {
+                Text("\(progress.completed) of \(progress.total) complete")
+                Text("\(progress.categorized) categorized")
+                Text("\(progress.failed) failed")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            if let currentConversation = progress.currentConversation {
+                Text("Current: \(currentConversation)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if isRunning {
+                Button(progress.isCancelling ? "Cancelling..." : "Cancel After Current Conversation") {
+                    onCancel()
+                }
+                .disabled(progress.isCancelling)
+            }
+
+            if !progress.failureMessages.isEmpty {
+                DisclosureGroup("Failures (\(progress.failureMessages.count))") {
+                    ForEach(Array(progress.failureMessages.prefix(10)), id: \.self) { message in
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(.top, 4)
+    }
+}
+
+private struct ConversationCategorizationCostEstimateView: View {
+    let estimate: CategorizationCostEstimate
+
+    var body: some View {
+        Text("Estimated cost for one click: \(CostEstimateFormat.currency(estimate.standardCost)) using \(estimate.totalSampleMessages) recent \(messageLabel). Estimate is local; OpenAI is only called when you click the button.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
+    private var messageLabel: String {
+        estimate.totalSampleMessages == 1 ? "message" : "messages"
+    }
+}
+
+private enum CostEstimateFormat {
+    static func currency(_ value: Double) -> String {
+        if value > 0 && value < 0.01 {
+            return "<$0.01"
+        }
+
+        return currencyFormatter.string(from: NSNumber(value: value)) ?? String(format: "$%.2f", value)
+    }
+
+    private static let currencyFormatter: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.minimumFractionDigits = 2
+        formatter.maximumFractionDigits = 2
+        return formatter
+    }()
+}
+
+private struct ConversationSortPicker: View {
+    @Binding var selection: ConversationSort
+
+    var body: some View {
+        Picker("Sort", selection: $selection) {
+            ForEach(ConversationSort.allCases) { sort in
+                Text(sort.displayName).tag(sort)
+            }
+        }
+        .pickerStyle(.segmented)
+    }
+}
+
+private struct ChatRow: View {
+    let chat: ChatSummary
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(chat.displayName)
+                .font(.headline)
+
+            HStack(spacing: 8) {
+                if let serviceName = chat.serviceName {
+                    Text(serviceName)
+                }
+
+                Text("\(chat.participantCount) participant\(chat.participantCount == 1 ? "" : "s")")
+                Text("\(chat.messageCount) messages")
+
+                if chat.resolvedContactCount == 0 && !chat.participantHandles.isEmpty {
+                    Text("Unmatched")
+                }
+
+                if let lastInteractionDate = chat.lastInteractionDate {
+                    Text(Self.dateFormatter.string(from: lastInteractionDate))
+                }
+
+                if chat.isArchived {
+                    Text("Archived")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .none
+        return formatter
+    }()
+}
+
+private struct ConversationDetailView: View {
+    let chat: ChatSummary
+    let messages: [ConversationMessage]
+    let todos: [ConversationTodo]
+    let isLoadingMessages: Bool
+    let messageErrorNotice: ErrorNotice?
+    let messageLimit: Int
+    let onReloadMessages: () -> Void
+    let errorNotice: ErrorNotice?
+    let onDismissError: () -> Void
+    let onCategoryChange: (RelationshipCategory) -> Void
+    let onAddTodo: (String) -> Void
+    let onToggleTodo: (ConversationTodo) -> Void
+    let onDeleteTodo: (ConversationTodo) -> Void
+    let hasOpenAIAPIKey: Bool
+    let isCategorizing: Bool
+    let categorizationCostEstimate: CategorizationCostEstimate?
+    let classificationRationale: String?
+    let onCategorizeWithLLM: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HStack {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(chat.displayName)
+                        .font(.title2)
+                        .fontWeight(.semibold)
+
+                    Text("\(chat.messageCount) messages · \(chat.sentCount) sent · \(chat.receivedCount) received")
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Picker("Category", selection: Binding(
+                    get: { chat.relationshipCategory },
+                    set: onCategoryChange
+                )) {
+                    ForEach(RelationshipCategory.allCases) { category in
+                        Text(category.displayName).tag(category)
+                    }
+                }
+                .frame(width: 220)
+            }
+
+            if let errorNotice {
+                ErrorNoticeView(notice: errorNotice, onDismiss: onDismissError)
+            }
+
+            ConversationMessagesView(
+                messages: messages,
+                isLoading: isLoadingMessages,
+                errorNotice: messageErrorNotice,
+                messageLimit: messageLimit,
+                participantCount: chat.participantCount,
+                onReload: onReloadMessages
+            )
+            .frame(minHeight: 220, maxHeight: 320)
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("LLM Categorization")
+                    .font(.headline)
+
+                Text("Sends a small recent message sample for this conversation to OpenAI and applies one category.")
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Button {
+                        onCategorizeWithLLM()
+                    } label: {
+                        if isCategorizing {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Text("Categorize with LLM")
+                        }
+                    }
+                    .disabled(isCategorizing || !hasOpenAIAPIKey)
+
+                    if let classificationRationale, !classificationRationale.isEmpty {
+                        Text(classificationRationale)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if let categorizationCostEstimate {
+                    ConversationCategorizationCostEstimateView(estimate: categorizationCostEstimate)
+                }
+
+                if !hasOpenAIAPIKey {
+                    Text("Add your OpenAI API key in Settings before categorizing.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            TodoListView(
+                title: "Conversation Todos",
+                todos: todos,
+                chatNamesByGuid: [:],
+                onAddTodo: onAddTodo,
+                onToggleTodo: onToggleTodo,
+                onDeleteTodo: onDeleteTodo
+            )
+
+            Spacer()
+        }
+        .padding()
+    }
+}
+
+private struct ConversationMessagesView: View {
+    let messages: [ConversationMessage]
+    let isLoading: Bool
+    let errorNotice: ErrorNotice?
+    let messageLimit: Int
+    let participantCount: Int
+    let onReload: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Messages")
+                        .font(.headline)
+
+                    Text("Showing latest \(messageLimit) text messages and attachments.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Button("Reload", action: onReload)
+                    .disabled(isLoading)
+            }
+
+            if isLoading {
+                ProgressView("Loading messages...")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let errorNotice {
+                ErrorNoticeView(notice: errorNotice)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            } else if messages.isEmpty {
+                ContentUnavailableView("No text messages", systemImage: "message")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 10) {
+                            ForEach(messages) { message in
+                                MessageBubbleView(
+                                    message: message,
+                                    showSender: participantCount > 1
+                                )
+                                .id(message.id)
+                            }
+                        }
+                        .padding(.vertical, 6)
+                    }
+                    .background(Color.secondary.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .onAppear {
+                        scrollToLatestMessage(using: proxy)
+                    }
+                }
+            }
+        }
+    }
+
+    private func scrollToLatestMessage(using proxy: ScrollViewProxy) {
+        guard let lastMessageID = messages.last?.id else {
+            return
+        }
+
+        proxy.scrollTo(lastMessageID, anchor: .bottom)
+    }
+}
+
+private struct MessageBubbleView: View {
+    let message: ConversationMessage
+    let showSender: Bool
+
+    var body: some View {
+        HStack(alignment: .bottom) {
+            if message.isFromMe {
+                Spacer(minLength: 80)
+            }
+
+            VStack(alignment: message.isFromMe ? .trailing : .leading, spacing: 4) {
+                if !message.isFromMe && showSender, let senderHandle = message.senderHandle {
+                    Text(senderHandle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+
+                Text(message.text)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(message.isFromMe ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.14))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                if let date = message.date {
+                    Text(Self.dateFormatter.string(from: date))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: 560, alignment: message.isFromMe ? .trailing : .leading)
+
+            if !message.isFromMe {
+                Spacer(minLength: 80)
+            }
+        }
+        .padding(.horizontal, 10)
+    }
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter
+    }()
+}
+
+private struct TodoListView: View {
+    let title: String
+    let todos: [ConversationTodo]
+    let chatNamesByGuid: [String: String]
+    let onAddTodo: (String) -> Void
+    let onToggleTodo: (ConversationTodo) -> Void
+    let onDeleteTodo: (ConversationTodo) -> Void
+
+    @State private var newTodoTitle = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text(title)
+                    .font(.headline)
+
+                HStack {
+                    TextField("New todo", text: $newTodoTitle)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit(addTodo)
+
+                    Button("Add", action: addTodo)
+                        .keyboardShortcut(.return, modifiers: .command)
+                }
+            }
+            .frame(maxWidth: 720, alignment: .leading)
+
+            if todos.isEmpty {
+                ContentUnavailableView("No todos", systemImage: "checkmark.circle")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(todos) { todo in
+                    HStack(alignment: .top) {
+                        Button {
+                            onToggleTodo(todo)
+                        } label: {
+                            Image(systemName: todo.isCompleted ? "checkmark.circle.fill" : "circle")
+                        }
+                        .buttonStyle(.plain)
+
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(todo.title)
+                                .strikethrough(todo.isCompleted)
+                                .foregroundStyle(todo.isCompleted ? .secondary : .primary)
+
+                            if let chatGuid = todo.chatGuid,
+                               let chatName = chatNamesByGuid[chatGuid] {
+                                Text(chatName)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        Spacer()
+
+                        Button("Delete") {
+                            onDeleteTodo(todo)
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    .padding(.vertical, 3)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func addTodo() {
+        onAddTodo(newTodoTitle)
+        newTodoTitle = ""
+    }
+}
+
+private struct StatLabel: View {
+    let title: String
+    let value: String
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(title)
+                .foregroundStyle(.secondary)
+            Text(value)
+        }
+    }
+}
+
+#Preview {
+    ContentView()
+}
